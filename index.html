@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lecteur M3U Playlist & Stream</title>
+    <!-- Chargement de Tailwind CSS pour un style rapide et responsive -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Configuration de la police Inter -->
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6;
+        }
+        /* Style pour les éléments cliquables dans la playlist */
+        .playlist-item {
+            cursor: pointer;
+            transition: background-color 0.15s;
+        }
+        .playlist-item:hover {
+            background-color: #f1f5f9; /* slate-100 */
+        }
+        .playlist-item.active {
+            background-color: #e0f2f7; /* cyan-50 */
+            border-left: 4px solid #06b6d4; /* cyan-500 */
+            font-weight: 600;
+        }
+    </style>
+    <!-- Chargement de la librairie HLS.js (pour les flux HLS, souvent utilisés dans M3U) -->
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.0"></script>
+    <!-- Firebase Imports for Authentication and Firestore -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Expose Firebase objects globally for use in the script tag
+        window.firebaseApp = initializeApp(JSON.parse(window.__firebase_config));
+        window.auth = getAuth(window.firebaseApp);
+        window.db = getFirestore(window.firebaseApp);
+
+        // Function to handle initial sign-in
+        async function authenticate() {
+            try {
+                if (typeof window.__initial_auth_token !== 'undefined' && window.__initial_auth_token) {
+                    await signInWithCustomToken(window.auth, window.__initial_auth_token);
+                } else {
+                    await signInAnonymously(window.auth);
+                }
+            } catch (error) {
+                console.error("Firebase Auth Error:", error);
+            }
+        }
+
+        // Authentication State Listener
+        onAuthStateChanged(window.auth, (user) => {
+            if (user) {
+                // User is signed in, set the userId globally
+                window.userId = user.uid;
+                const userIdDisplay = document.getElementById('userIdDisplay');
+                if (userIdDisplay) {
+                    userIdDisplay.textContent = `ID Utilisateur: ${user.uid}`;
+                }
+            } else {
+                // User is signed out, use a random ID
+                window.userId = crypto.randomUUID();
+            }
+            // Trigger any initialization that depends on auth being ready
+            if (typeof window.onFirebaseReady === 'function') {
+                window.onFirebaseReady();
+            }
+        });
+
+        // Start authentication process
+        authenticate();
+    </script>
+</head>
+<body class="p-4 sm:p-8 min-h-screen flex flex-col items-center">
+
+    <div class="w-full max-w-6xl bg-white shadow-xl rounded-xl p-6 flex flex-col lg:flex-row">
+        
+        <!-- Colonne de Lecture (Gauche) -->
+        <div class="lg:w-2/3 lg:pr-6 mb-8 lg:mb-0">
+            <h1 class="text-3xl font-bold text-gray-800 mb-6 text-center lg:text-left">Lecteur M3U & HLS</h1>
+
+            <!-- Interface de Saisie du Lien -->
+            <div class="space-y-4 mb-8">
+                <label for="m3uLink" class="block text-sm font-medium text-gray-700">Lien M3U/HLS :</label>
+                <div class="flex flex-col sm:flex-row space-y-3 sm:space-y-0 sm:space-x-3">
+                    <input type="text" id="m3uLink"
+                           class="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 shadow-sm"
+                           placeholder="URL de Playlist M3U ou de flux HLS (e.g. *.m3u8)"
+                           value="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8">
+                    <button id="loadButton"
+                            class="px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition duration-150 ease-in-out whitespace-nowrap">
+                        Charger
+                    </button>
+                </div>
+                <p id="statusMessage" class="text-sm text-gray-500 h-5"></p>
+            </div>
+
+            <!-- Lecteur Vidéo -->
+            <div class="relative pt-[56.25%] bg-black rounded-lg overflow-hidden shadow-2xl">
+                <video id="videoPlayer" class="absolute top-0 left-0 w-full h-full" controls autoplay></video>
+            </div>
+            
+            <p id="nowPlaying" class="mt-4 text-lg font-semibold text-gray-700 truncate">
+                Lecture en cours : Aucun
+            </p>
+        </div>
+
+        <!-- Colonne de Playlist (Droite) -->
+        <div class="lg:w-1/3 border-t lg:border-t-0 lg:border-l lg:pl-6 pt-6 lg:pt-0">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">Playlists / Chaînes (<span id="channelCount">0</span>)</h2>
+            
+            <!-- NOUVEAUX ÉLÉMENTS : Barre de recherche et Tri -->
+            <div class="space-y-3 mb-4">
+                <!-- Recherche -->
+                <input type="text" id="searchInput"
+                       placeholder="Rechercher une chaîne..."
+                       class="w-full p-2 border border-gray-300 rounded-lg focus:ring-cyan-500 focus:border-cyan-500 shadow-sm">
+                
+                <!-- Tri -->
+                <select id="sortSelect" class="w-full p-2 border border-gray-300 rounded-lg shadow-sm">
+                    <option value="name_asc">Trier par Nom (A-Z)</option>
+                    <option value="name_desc">Trier par Nom (Z-A)</option>
+                </select>
+            </div>
+            <!-- FIN NOUVEAUX ÉLÉMENTS -->
+
+            <div id="playlistContainer" class="max-h-96 overflow-y-auto border border-gray-200 rounded-lg">
+                <p id="playlistPlaceholder" class="p-4 text-sm text-gray-500">
+                    Chargez un fichier M3U pour voir la liste des chaînes ici.
+                </p>
+                <!-- Les éléments de playlist seront insérés ici -->
+            </div>
+            
+            <!-- Informations d'état -->
+            <div class="mt-6 text-xs text-gray-400 border-t pt-4">
+                <p>App ID: <span class="font-mono text-gray-500 text-ellipsis overflow-hidden inline-block max-w-full" title="Identifiant de l'application" style="max-width: 100%;">
+                    <script>document.write(typeof __app_id !== 'undefined' ? __app_id : 'default-app-id');</script>
+                </span></p>
+                <p id="userIdDisplay">Authentification en cours...</p>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        // Variables globales
+        const video = document.getElementById('videoPlayer');
+        const m3uLinkInput = document.getElementById('m3uLink');
+        const loadButton = document.getElementById('loadButton');
+        const statusMessage = document.getElementById('statusMessage');
+        const playlistContainer = document.getElementById('playlistContainer');
+        const playlistPlaceholder = document.getElementById('playlistPlaceholder');
+        const channelCount = document.getElementById('channelCount');
+        const nowPlaying = document.getElementById('nowPlaying');
+
+        // NOUVEAUX ÉLÉMENTS DE RECHERCHE/TRI
+        const searchInput = document.getElementById('searchInput');
+        const sortSelect = document.getElementById('sortSelect');
+        let allChannels = []; // Stocke la liste complète non filtrée
+        let currentHls = null; // Instance Hls.js actuelle
+
+        /**
+         * Structure pour stocker les informations du flux
+         * @typedef {Object} Channel
+         * @property {string} url - L'URL du flux vidéo.
+         * @property {string} name - Le nom de la chaîne.
+         * @property {string} logo - L'URL du logo (si disponible).
+         */
+        
+        /**
+         * Met à jour le message d'état sur l'interface utilisateur.
+         * @param {string} message - Le message à afficher.
+         * @param {string} type - 'success', 'error', 'info'.
+         */
+        function updateStatus(message, type = 'info') {
+            statusMessage.textContent = message;
+            statusMessage.className = 'text-sm h-5 transition duration-300 ease-in-out';
+            switch (type) {
+                case 'success':
+                    statusMessage.classList.add('text-green-600');
+                    break;
+                case 'error':
+                    statusMessage.classList.add('text-red-600', 'font-semibold');
+                    break;
+                case 'info':
+                default:
+                    statusMessage.classList.add('text-gray-500');
+                    break;
+            }
+        }
+
+        /**
+         * Arrête et détruit l'instance HLS.js existante.
+         */
+        function stopCurrentHls() {
+            if (currentHls) {
+                currentHls.destroy();
+                currentHls = null;
+            }
+            video.removeAttribute('src');
+            video.load();
+        }
+
+        /**
+         * Gère le chargement et la lecture du flux vidéo.
+         * @param {Channel} channel - L'objet Channel contenant l'URL et le nom.
+         */
+        function loadVideo(channel) {
+            const url = channel.url;
+            
+            // Mettre à jour l'affichage de lecture en cours
+            nowPlaying.textContent = `Lecture en cours : ${channel.name}`;
+
+            // Mettre en évidence l'élément actif dans la playlist
+            document.querySelectorAll('.playlist-item').forEach(item => {
+                item.classList.remove('active');
+            });
+            const activeElement = document.getElementById(`channel-${btoa(channel.url).replace(/=/g, '')}`);
+            if (activeElement) {
+                activeElement.classList.add('active');
+            }
+            
+            updateStatus('Tentative de chargement du flux...');
+            stopCurrentHls(); // Arrête tout flux précédent
+
+            if (Hls.isSupported()) {
+                // Utilise HLS.js
+                currentHls = new Hls();
+
+                currentHls.on(Hls.Events.ERROR, function (event, data) {
+                    if (data.fatal) {
+                        switch (data.type) {
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                // Cas le plus fréquent : problème de CORS, 404, ou blocage serveur
+                                updateStatus(`Erreur Réseau Fatale (HLS) : Impossible de charger le flux. Vérifiez CORS ou l'URL. Détails: ${data.details}`, 'error');
+                                currentHls.destroy();
+                                break;
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                updateStatus('Erreur Média Fatale (HLS) : Le flux est corrompu ou illisible. Tentative de récupération...', 'error');
+                                currentHls.recoverMediaError();
+                                break;
+                            default:
+                                updateStatus(`Erreur Fatale HLS.js : ${data.details}`, 'error');
+                                currentHls.destroy();
+                                break;
+                        }
+                    }
+                });
+
+                currentHls.loadSource(url);
+                currentHls.attachMedia(video);
+
+                currentHls.on(Hls.Events.MANIFEST_PARSED, function () {
+                    video.play()
+                        .then(() => updateStatus(`Lecture de '${channel.name}' démarrée.`, 'success'))
+                        .catch(e => {
+                            // Détection plus robuste des erreurs de lecture automatique (Autoplay Blocking)
+                            const isAutoplayBlocked = e.name === "NotAllowedError" || e.name === "NotSupportedError" || e.message.includes("aborted by the user agent");
+                            
+                            if (isAutoplayBlocked) {
+                                // Message clair pour l'utilisateur
+                                updateStatus('Erreur de lecture : La lecture automatique est généralement bloquée par votre navigateur. Veuillez cliquer directement sur le bouton "Play" de la vidéo pour démarrer la lecture.', 'info');
+                            } else {
+                                // Erreur de lecture inattendue
+                                updateStatus(`Erreur de lecture inattendue : ${e.message}`, 'error');
+                            }
+                        });
+                });
+
+            } else if (video.canPlayType('application/vnd.apple.mpegurl') || video.canPlayType('application/x-mpegurl')) {
+                // Support natif pour HLS (Safari)
+                video.src = url;
+                video.addEventListener('loadedmetadata', function() {
+                    video.play()
+                        .then(() => updateStatus(`Lecture native de '${channel.name}' démarrée.`, 'success'))
+                        .catch(e => {
+                            // Même gestion pour l'autoplay natif
+                            updateStatus('Lecture native bloquée. Cliquez sur Play directement sur la vidéo.', 'info');
+                        });
+                }, { once: true });
+            } else {
+                updateStatus('Erreur: Votre navigateur ne supporte pas le format de streaming HLS.', 'error');
+            }
+        }
+
+        /**
+         * Analyse le contenu d'un fichier M3U (Playlist) pour extraire les chaînes.
+         * @param {string} m3uContent - Le contenu texte du fichier M3U.
+         * @returns {Channel[]} - Un tableau d'objets Channel.
+         */
+        function parseM3U(m3uContent) {
+            const lines = m3uContent.split('\n');
+            const channels = [];
+            let currentChannel = {};
+
+            // Un REGEX pour capturer les attributs comme tvg-name, tvg-logo, group-title, etc.
+            const extinfRegex = /#EXTINF:-1\s*([^,]*),(.*)/;
+            const logoRegex = /tvg-logo="([^"]*)"/;
+
+            if (!lines[0].startsWith('#EXTM3U')) {
+                // Non-playlist file or single link will be handled outside this function
+                return null;
+            }
+
+            for (const line of lines) {
+                const trimmedLine = line.trim();
+
+                if (trimmedLine.startsWith('#EXTINF')) {
+                    // Ligne d'information (metadata)
+                    const match = trimmedLine.match(extinfRegex);
+                    if (match) {
+                        const attributesString = match[1].trim();
+                        const channelName = match[2].trim();
+                        
+                        // Extraire le logo
+                        const logoMatch = attributesString.match(logoRegex);
+                        const logoUrl = logoMatch ? logoMatch[1] : '';
+
+                        currentChannel = {
+                            name: channelName || 'Chaîne inconnue',
+                            logo: logoUrl,
+                            url: ''
+                        };
+                    }
+                } else if (trimmedLine.startsWith('http') || trimmedLine.startsWith('rtsp') || trimmedLine.startsWith('udp')) {
+                    // Ligne de l'URL du flux
+                    if (currentChannel.name) {
+                        currentChannel.url = trimmedLine;
+                        channels.push(currentChannel);
+                        currentChannel = {}; // Réinitialiser pour la prochaine chaîne
+                    }
+                }
+            }
+            return channels;
+        }
+
+        /**
+         * Affiche la liste des chaînes (déjà filtrée et triée).
+         * @param {Channel[]} channelsToRender - Le tableau de chaînes à afficher.
+         */
+        function renderPlaylist(channelsToRender) {
+            playlistContainer.innerHTML = '';
+            channelCount.textContent = channelsToRender.length;
+
+            if (channelsToRender.length === 0) {
+                playlistPlaceholder.textContent = 'Aucune chaîne ne correspond à votre recherche.';
+                playlistPlaceholder.style.display = 'block';
+                return;
+            }
+            
+            playlistPlaceholder.style.display = 'none';
+
+            channelsToRender.forEach((channel, index) => {
+                const element = document.createElement('div');
+                // Crée un ID unique pour l'élément DOM basé sur l'URL (encodé en base64)
+                const channelId = `channel-${btoa(channel.url).replace(/=/g, '')}`;
+
+                element.id = channelId;
+                element.className = 'playlist-item flex items-center p-3 border-b border-gray-100 hover:bg-slate-100 last:border-b-0';
+                element.innerHTML = `
+                    ${channel.logo ? 
+                        `<img src="${channel.logo}" onerror="this.onerror=null; this.src='https://placehold.co/40x40/d1d5db/4b5563?text=TV';" 
+                        alt="${channel.name} logo" class="w-10 h-10 object-contain rounded mr-3">` :
+                        `<div class="w-10 h-10 flex items-center justify-center bg-gray-200 text-gray-700 rounded mr-3 text-sm font-bold">
+                            ${(channel.name.charAt(0) || '?').toUpperCase()}
+                        </div>`
+                    }
+                    <span class="text-sm text-gray-800 truncate">${channel.name}</span>
+                `;
+
+                element.addEventListener('click', () => {
+                    loadVideo(channel);
+                });
+
+                playlistContainer.appendChild(element);
+            });
+        }
+        
+        /**
+         * Filtre et trie la liste complète des chaînes, puis appelle renderPlaylist.
+         */
+        function filterAndSortChannels() {
+            const searchTerm = searchInput.value.toLowerCase().trim();
+            const sortOption = sortSelect.value;
+            let filteredChannels = [...allChannels];
+
+            // 1. Filtrage
+            if (searchTerm) {
+                filteredChannels = filteredChannels.filter(channel => 
+                    channel.name.toLowerCase().includes(searchTerm) || 
+                    channel.url.toLowerCase().includes(searchTerm)
+                );
+            }
+
+            // 2. Tri
+            filteredChannels.sort((a, b) => {
+                const nameA = a.name.toLowerCase();
+                const nameB = b.name.toLowerCase();
+                
+                if (sortOption === 'name_asc') {
+                    return nameA > nameB ? 1 : (nameA < nameB ? -1 : 0);
+                } else if (sortOption === 'name_desc') {
+                    return nameA < nameB ? 1 : (nameA > nameB ? -1 : 0);
+                }
+                return 0; // Aucun tri par défaut
+            });
+
+            // 3. Rendu
+            renderPlaylist(filteredChannels);
+            
+            // Re-lecture automatique de la première chaîne si elle existe et qu'il n'y a rien en cours
+            if (filteredChannels.length > 0 && video.paused && video.getAttribute('src') === null) {
+                loadVideo(filteredChannels[0]);
+            }
+        }
+
+
+        /**
+         * Gère le chargement d'un lien (M3U ou simple flux).
+         */
+        async function handleLoadStream() {
+            const url = m3uLinkInput.value.trim();
+            if (!url) {
+                updateStatus('Veuillez entrer un lien de streaming valide.', 'info');
+                return;
+            }
+            
+            loadButton.disabled = true;
+            updateStatus('Chargement du lien en cours...');
+            allChannels = []; // Réinitialiser la liste complète
+
+            // 1. Tenter de charger l'URL comme un flux simple (M3U8 ou autre)
+            if (!url.toLowerCase().endsWith('.m3u') && !url.toLowerCase().endsWith('.m3u8')) {
+                // Traiter comme un flux unique
+                const channel = { name: url.substring(url.lastIndexOf('/') + 1) || 'Flux direct', url: url, logo: '' };
+                allChannels.push(channel);
+                playlistPlaceholder.textContent = 'Lecture du flux direct (pas de playlist).';
+                loadVideo(channel);
+                loadButton.disabled = false;
+                filterAndSortChannels(); // Afficher la playlist (1 élément)
+                return;
+            }
+            
+            // 2. Tenter de récupérer et parser le fichier M3U
+            try {
+                const response = await fetch(url);
+                if (!response.ok) {
+                    throw new Error(`Erreur HTTP: ${response.status}`);
+                }
+                const content = await response.text();
+                
+                const channels = parseM3U(content);
+
+                if (channels && channels.length > 0) {
+                    allChannels = channels;
+                    updateStatus(`Playlist M3U chargée et analysée. ${allChannels.length} chaînes trouvées.`, 'success');
+                    filterAndSortChannels(); // Afficher la playlist complète, triée et non filtrée
+                    if (allChannels.length > 0) {
+                        loadVideo(allChannels[0]); // Charger la première chaîne
+                    }
+
+                } else {
+                    // Si le parsing échoue mais qu'il s'agit d'un fichier M3U/M3U8
+                    const channel = { name: url.substring(url.lastIndexOf('/') + 1) || 'Flux HLS', url: url, logo: '' };
+                    allChannels.push(channel);
+                    playlistPlaceholder.textContent = 'Fichier M3U/M3U8 chargé, mais aucune chaîne trouvée. Lecture directe tentée.';
+                    loadVideo(channel);
+                    filterAndSortChannels();
+                }
+            } catch (error) {
+                console.error("Erreur de chargement/parsing M3U:", error);
+                
+                // En cas d'échec de la requête (e.g. CORS, 404), on tente de le charger directement
+                const channel = { name: url.substring(url.lastIndexOf('/') + 1) || 'Erreur - Tentative directe', url: url, logo: '' };
+                allChannels.push(channel);
+                updateStatus(`Erreur de chargement de la playlist M3U/M3U8 (${error.message}). Tentative de lecture directe.`, 'error');
+                playlistPlaceholder.textContent = 'Échec du chargement M3U. Tentative de lecture directe du lien.';
+                loadVideo(channel);
+                filterAndSortChannels();
+
+            } finally {
+                loadButton.disabled = false;
+            }
+        }
+
+        // --- Écouteurs d'Événements ---
+
+        // Gestionnaire d'erreurs pour l'élément vidéo natif 
+        video.addEventListener('error', function() {
+            if (video.error) {
+                let msg = '';
+                switch (video.error.code) {
+                    case video.error.MEDIA_ERR_NETWORK:
+                        msg = 'Erreur réseau (Code 2) : Le flux n\'est pas accessible (CORS ou 404). Vérifiez si l\'URL est correcte.';
+                        break;
+                    case video.error.MEDIA_ERR_DECODE:
+                        msg = 'Erreur de décodage (Code 3) : Le flux est corrompu ou le format n\'est pas supporté par votre navigateur.';
+                        break;
+                    case video.error.MEDIA_ERR_SRC_NOT_SUPPORTED:
+                        msg = 'Erreur de source (Code 4) : Le format de flux spécifié n\'est pas supporté par votre navigateur.';
+                        break;
+                    default:
+                        msg = `Erreur Vidéo Inconnue (Code ${video.error.code}).`;
+                }
+                updateStatus(`ÉCHEC DE CHARGEMENT : ${msg}`, 'error');
+                stopCurrentHls(); // S'assurer de nettoyer pour sortir de la boucle de chargement
+            }
+        });
+
+        // NOUVEAU: Écouteurs pour la recherche et le tri
+        searchInput.addEventListener('input', filterAndSortChannels);
+        sortSelect.addEventListener('change', filterAndSortChannels);
+
+        // Écouteur pour le bouton de chargement
+        loadButton.addEventListener('click', handleLoadStream);
+
+        // Écouteur pour la touche Entrée dans le champ de saisie du lien M3U
+        m3uLinkInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                handleLoadStream();
+            }
+        });
+
+        // Fonction appelée après l'initialisation de Firebase
+        window.onFirebaseReady = function() {
+            // Charger le lien de démo au démarrage
+            handleLoadStream();
+        };
+
+    </script>
+</body>
+</html>
